@@ -1,0 +1,266 @@
+-----set timezone = 'US/eastern'
+
+DO $$
+DECLARE 
+	analysis_date timestamp = '2019-03-13';
+	FC_timezone interval = '0 hours';
+
+	pallet_log_row record;
+	pallet_log_pre_row record;
+	cursor_pallet_log refcursor;
+	assembly_time_threshold double precision = 480; -- time unit: second
+	count_pallet_task_picking_total integer = 0;
+	count_pallet_task_picking_finished integer = 0;
+	count_pallet_task_picking_skipped integer = 0;
+	count_skipped_with_adequate_preparation_time integer = 0;
+	count_skipped_not_adequate_preparation_time integer = 0;
+
+	log_type character varying;
+
+	pallet_log_detail_row record;
+	pallet_log_detail_pre_row record;
+	current_pallet_id integer;
+	current_destination_location integer;
+	current_task_start_location integer;
+	current_task_type character varying;
+	task_created_dttm timestamp with time zone;
+	task_finish_dttm timestamp with time zone;
+	preparation_time double precision;
+	task_finished_flag boolean;
+
+
+	cim_row record;
+	cart_picked_element_index integer;
+	cart_picked_element integer;
+	skip_reason_flags integer[] = '{0,0,0,0,0,0,0,0,0}';
+	skip_reason_flags_index integer;
+	new_cart_id_flag boolean;
+	skipped_distinct_line_flag boolean;
+	count_total_line integer = 0;
+	count_gtp_line integer = 0;
+	count_finished_gtp_line integer = 0;
+	count_negative integer = 0;
+	count_skipped_line integer = 0;
+	count_skipped_distinct_line integer = 0;
+	count_skipped_gtp_line integer = 0;
+	count_skipped_p2c_line integer = 0;
+	count_skipped_mm_line integer = 0;
+	count_skipped_gtp_line_inventory_short integer = 0;
+	count_skipped_gtp_line_pallet_assembly integer = 0;
+	count_skipped_gtp_line_other_reasons integer = 0;
+	count_replen_lines integer = 0;
+	count_ic_pallet integer = 0;
+	count_skipped_line_pallet_assembly integer = 0;
+	count_skipped_line_pallet_assembly_segment integer = 0;
+	result_gtp_skip_rate double precision = 0;
+	result_gtp_skip_rate_segment double precision = 0;
+	result_skipped_gtp_line integer = 0;
+	result_skipped_gtp_line_segment integer = 0;
+	result_skip_rate_rex_view double precision = 0;
+
+	skip_task_detail_pallet_label character varying;
+	skip_task_detail_destination_location character varying;
+	skip_task_detail_start_location character varying;
+	skip_task_detail_start_time timestamp;
+	skip_task_detail_skip_time timestamp;
+
+	finish_task_detail_pallet_label character varying;
+	finish_task_detail_destination_location character varying;
+	finish_task_detail_start_location character varying;
+	finish_task_detail_start_time timestamp;
+	finish_task_detail_finish_time timestamp;
+
+	row_index integer = 0;
+	
+BEGIN
+
+raise notice 'analysis_date = %', (analysis_date)::date;
+
+analysis_date = analysis_date - FC_timezone;
+
+FOR pallet_log_row IN
+	select pallet_id, current_location, created_dttm, MAX(pallet_location_log_id) AS max_pallet_location_log_id 
+	from pallet_location_log 
+	where created_dttm > (analysis_date + interval '5 hours') AND created_dttm < (analysis_date + interval '28 hours')
+	group by pallet_id, current_location, created_dttm
+	order by pallet_id ASC, created_dttm ASC
+	-- LIMIT 1000
+LOOP
+	row_index = row_index + 1;
+
+	-- raise notice '%', pallet_log_row;
+
+	IF row_index > 1 THEN
+		pallet_log_detail_pre_row = pallet_log_detail_row;
+	END IF;
+	select * from pallet_location_log into pallet_log_detail_row where pallet_location_log_id = pallet_log_row.max_pallet_location_log_id;
+
+	-- raise notice '%', pallet_log_detail_row;
+
+	IF pallet_log_detail_row.update_type = 1 THEN
+		log_type = 'current_location_change';
+	ELSIF pallet_log_detail_row.update_type IN (2,3,4) THEN
+		log_type = 'task_change';
+	ELSE
+		log_type = 'others';
+	END IF;
+
+	IF current_pallet_id IS NULL OR current_pallet_id != pallet_log_detail_row.pallet_id THEN
+		/**如果更换pallet_id时任务仍未结束，则不能统计进去**/
+		
+		current_pallet_id = pallet_log_detail_row.pallet_id;
+		IF log_type = 'task_change' THEN
+			IF pallet_log_detail_row.destination_location_id IS NOT NULL THEN
+				current_destination_location = pallet_log_detail_row.destination_location_id;
+				current_task_type = pallet_log_detail_row.task_type;
+				task_created_dttm = pallet_log_detail_row.created_dttm;
+				current_task_start_location = pallet_log_detail_row.current_location;
+			END IF;
+		ELSE
+			current_destination_location = NULL;
+			current_task_type = NULL;
+			task_created_dttm = NULL;
+			task_finish_dttm = NULL;
+			current_task_start_location = NULL;
+		END IF;
+	ELSE
+		IF log_type = 'task_change' THEN
+			
+			IF pallet_log_detail_row.update_type IN (3) THEN -- task set to NULL
+				/*********** task end *****************/
+				IF current_task_type = 'picking' THEN
+					count_pallet_task_picking_total = count_pallet_task_picking_total + 1;
+					task_finished_flag = (current_destination_location = (select parent_location_id from location where location_id = (select parent_location_id from location where location_id =pallet_log_detail_row.current_location)));
+					
+					IF task_finished_flag THEN
+						count_pallet_task_picking_finished = count_pallet_task_picking_finished + 1;
+						task_finish_dttm = pallet_log_detail_pre_row.created_dttm;
+						preparation_time = extract(epoch from (task_finish_dttm - task_created_dttm));
+						
+						-- 这里剔除起始位置和目标位置相同的任务，因为没有AGV搬运过
+						IF NOT (current_destination_location = (select parent_location_id from location where location_id = (select parent_location_id from location where location_id =current_task_start_location)))
+						
+						THEN							
+							finish_task_detail_pallet_label = (select pallet_label from pallet_master where pallet_id = pallet_log_detail_row.pallet_id);
+							finish_task_detail_destination_location = (select location_name from location where location_id = current_destination_location);
+							finish_task_detail_start_location = (select location_name from location where location_id = current_task_start_location);
+							finish_task_detail_start_time = (task_created_dttm - FC_timezone)::timestamp;
+							finish_task_detail_finish_time = (task_finish_dttm - FC_timezone)::timestamp;
+							
+							raise notice 'finish_detail, %, %, %, %, %, %, %, %', count_pallet_task_picking_finished, 'finished', preparation_time, 
+								finish_task_detail_pallet_label, finish_task_detail_start_location, finish_task_detail_destination_location, finish_task_detail_start_time, 
+								finish_task_detail_finish_time;
+						ELSE
+							count_pallet_task_picking_total = count_pallet_task_picking_total - 1;
+							count_pallet_task_picking_finished = count_pallet_task_picking_finished - 1;
+						END IF;
+					ELSE
+						count_pallet_task_picking_skipped = count_pallet_task_picking_skipped + 1;
+						task_finish_dttm = pallet_log_detail_row.created_dttm;
+						preparation_time = extract(epoch from (task_finish_dttm - task_created_dttm));
+						
+						skip_task_detail_pallet_label = (select pallet_label from pallet_master where pallet_id = pallet_log_detail_row.pallet_id);
+						skip_task_detail_destination_location = (select location_name from location where location_id = current_destination_location);
+						skip_task_detail_start_location = (select location_name from location where location_id = current_task_start_location);
+						skip_task_detail_start_time = (task_created_dttm - FC_timezone)::timestamp;
+						skip_task_detail_skip_time = (task_finish_dttm - FC_timezone)::timestamp;
+						
+						raise notice 'skip_detail, %, %, %, %, %, %, %, %', count_pallet_task_picking_skipped, 'skipped', preparation_time, 
+							skip_task_detail_pallet_label, skip_task_detail_start_location, skip_task_detail_destination_location, skip_task_detail_start_time, 
+							skip_task_detail_skip_time;
+						
+						IF preparation_time >= assembly_time_threshold THEN
+							count_skipped_with_adequate_preparation_time = count_skipped_with_adequate_preparation_time + 1;
+						ELSE
+							count_skipped_not_adequate_preparation_time = count_skipped_not_adequate_preparation_time + 1;
+						END IF;
+					END IF;
+					
+					-- raise notice 'count, %, %, %', count_pallet_task_picking_total, (case task_finished_flag when true then 'finished' else 'skipped' end), preparation_time;
+					
+				END IF;
+				/*********** task end *****************/
+				
+				
+				
+				current_destination_location = NULL;
+				current_task_start_location = NULL;
+				current_task_type = NULL;
+				task_created_dttm = NULL;
+				task_finish_dttm = NULL;
+			END IF;
+
+			IF pallet_log_detail_row.update_type IN (4) THEN -- task set from NULL
+				
+				/*********** task end *****************/
+				IF current_task_type = 'picking' THEN
+					count_pallet_task_picking_total = count_pallet_task_picking_total + 1;
+					task_finished_flag = (current_destination_location = (select parent_location_id from location where location_id = (select parent_location_id from location where location_id =pallet_log_detail_row.current_location)));
+					
+					IF task_finished_flag THEN
+						count_pallet_task_picking_finished = count_pallet_task_picking_finished + 1;
+						task_finish_dttm = pallet_log_detail_pre_row.created_dttm;
+						preparation_time = extract(epoch from (task_finish_dttm - task_created_dttm));
+						
+						-- 这里剔除起始位置和目标位置相同的任务，因为没有AGV搬运过
+						IF NOT (current_destination_location = (select parent_location_id from location where location_id = (select parent_location_id from location where location_id =current_task_start_location))) THEN							
+							finish_task_detail_pallet_label = (select pallet_label from pallet_master where pallet_id = pallet_log_detail_row.pallet_id);
+							finish_task_detail_destination_location = (select location_name from location where location_id = current_destination_location);
+							finish_task_detail_start_location = (select location_name from location where location_id = current_task_start_location);
+							finish_task_detail_start_time = (task_created_dttm - FC_timezone)::timestamp;
+							finish_task_detail_finish_time = (task_finish_dttm - FC_timezone)::timestamp;
+							
+							raise notice 'finish_detail, %, %, %, %, %, %, %, %', count_pallet_task_picking_finished, 'finished', preparation_time, 
+								finish_task_detail_pallet_label, finish_task_detail_start_location, finish_task_detail_destination_location, finish_task_detail_start_time, 
+								finish_task_detail_finish_time;
+						ELSE
+							count_pallet_task_picking_total = count_pallet_task_picking_total - 1;
+							count_pallet_task_picking_finished = count_pallet_task_picking_finished - 1;
+						END IF;
+					ELSE
+						count_pallet_task_picking_skipped = count_pallet_task_picking_skipped + 1;
+						task_finish_dttm = pallet_log_detail_row.created_dttm;
+						preparation_time = extract(epoch from (task_finish_dttm - task_created_dttm));
+						
+						skip_task_detail_pallet_label = (select pallet_label from pallet_master where pallet_id = pallet_log_detail_row.pallet_id);
+						skip_task_detail_destination_location = (select location_name from location where location_id = current_destination_location);
+						skip_task_detail_start_location = (select location_name from location where location_id = current_task_start_location);
+						skip_task_detail_start_time = (task_created_dttm - FC_timezone)::timestamp;
+						skip_task_detail_skip_time = (task_finish_dttm - FC_timezone)::timestamp;
+						
+						raise notice 'skip_detail, %, %, %, %, %, %, %, %', count_pallet_task_picking_skipped, 'skipped', preparation_time, 
+							skip_task_detail_pallet_label, skip_task_detail_start_location, skip_task_detail_destination_location, skip_task_detail_start_time, 
+							skip_task_detail_skip_time;
+						
+						IF preparation_time >= assembly_time_threshold THEN
+							count_skipped_with_adequate_preparation_time = count_skipped_with_adequate_preparation_time + 1;
+						ELSE
+							count_skipped_not_adequate_preparation_time = count_skipped_not_adequate_preparation_time + 1;
+						END IF;
+					END IF;
+					
+					-- raise notice 'count, %, %, %', count_pallet_task_picking_total, (case task_finished_flag when true then 'finished' else 'skipped' end), preparation_time;
+					
+				END IF;
+				/*********** task end *****************/
+				
+				current_destination_location = pallet_log_detail_row.destination_location_id;
+				current_task_start_location = pallet_log_detail_row.current_location;
+				current_task_type = pallet_log_detail_row.task_type;
+				task_created_dttm = pallet_log_detail_row.created_dttm;
+			END IF;
+			
+		END IF;
+	END IF;
+
+	
+	
+	
+END LOOP;
+
+
+END$$;
+
+
+
+
