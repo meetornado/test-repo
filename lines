@@ -1,0 +1,3 @@
+select 'Finished_lines' AS "type", COUNT(cim_detail_id) from cim_detail 
+	where remaining_qty <= 0 and cim_header_id in (select cim_header_id from cim_header where status <> 99 and created_dttm >  '2019-6-10 5:00:00' and created_dttm <  '2019-6-12 4:00:00')
+	AND last_updated_dttm > '2019-6-11 5:00:00' and last_updated_dttm <= '2019-6-12 4:00:00'
